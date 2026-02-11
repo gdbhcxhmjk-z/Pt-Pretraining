@@ -174,6 +174,23 @@ class UniMolModel(BaseUnicoreModel):
                 args.encoder_attention_heads, args.activation_fn
             )
         self.classification_heads = nn.ModuleDict()
+        # ================== 【请在此处插入新代码】 ==================
+        # 这里的逻辑是：只有当 args 中存在 regression_target_names 且不为空时，才初始化回归头
+        # 这样 Step 1 (纯结构预训练) 就不会受到影响，只有 Step 2 (finetune) 会激活这里
+        self.regression_heads = nn.ModuleDict()
+        if hasattr(args, "regression_target_names") and args.regression_target_names:
+            targets = args.regression_target_names.split(',')
+            for target in targets:
+                # 使用 ClassificationHead 作为回归头 (num_classes=1)
+                # ClassificationHead 内部通常包含 pooling ([CLS] token 提取) 和 MLP
+                self.regression_heads[target] = ClassificationHead(
+                    input_dim=args.encoder_embed_dim,
+                    inner_dim=args.encoder_embed_dim,
+                    num_classes=1, 
+                    activation_fn=args.pooler_activation_fn,
+                    pooler_dropout=args.pooler_dropout,
+                )
+        # ==========================================================
         self.apply(init_bert_params)
 
     @classmethod
@@ -181,7 +198,7 @@ class UniMolModel(BaseUnicoreModel):
         """Build a new model instance."""
         return cls(args, task.dictionary)
 
-    def forward(
+   def forward(
         self,
         src_tokens,
         src_distance,
@@ -245,6 +262,15 @@ class UniMolModel(BaseUnicoreModel):
                 encoder_coord = coords_emb + coord_update
             if self.args.masked_dist_loss > 0:
                 encoder_distance = self.dist_head(encoder_pair_rep)
+                
+        # ------------------- [新增：多属性回归逻辑] -------------------
+        regression_outputs = {}
+        # 只有在 Step 2 传入了目标名称时，regression_heads 才有值
+        if hasattr(self, "regression_heads") and len(self.regression_heads) > 0:
+            for target_name, head_module in self.regression_heads.items():
+                # 使用 [CLS] token (即第 0 位) 进行回归
+                regression_outputs[target_name] = head_module(encoder_rep)
+        # -----------------------------------------------------------
 
         if classification_head_name is not None:
             logits = self.classification_heads[classification_head_name](encoder_rep)
@@ -257,7 +283,7 @@ class UniMolModel(BaseUnicoreModel):
                 encoder_coord,
                 x_norm,
                 delta_encoder_pair_rep_norm,
-            )         
+            )          
 
     def register_classification_head(
         self, name, num_classes=None, inner_dim=None, **kwargs
