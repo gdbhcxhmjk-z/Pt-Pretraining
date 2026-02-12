@@ -25,7 +25,7 @@ epoch=40
 dropout=0.1 # 建议给一点 dropout 防止过拟合
 warmup=0.06
 only_polar=0
-conf_size=11
+conf_size=1
 seed=0
 
 local_batch_size=32  # 单卡 Batch Size，取决于显存大小 (32G显存通常能跑32-64)
