@@ -4,7 +4,7 @@
 
 import logging
 import os
-
+import pickle
 import numpy as np
 from unicore.data import (
     Dictionary,
@@ -162,6 +162,10 @@ class UniMolFinetuneTask(UnicoreTask):
             type=int,
             help="1: only reserve polar hydrogen; 0: no hydrogen; -1: all hydrogen ",
         )
+        parser.add_argument("--property-norms-path", type=str, default="property_norms.pkl",
+                            help="path to the property_norms.pkl file")
+        parser.add_argument("--regression-target-names", type=str, default="homo,lumo,gap,dipole",
+                            help="comma separated names of the regression targets")
 
     def __init__(self, args, dictionary):
         super().__init__(args)
@@ -179,6 +183,20 @@ class UniMolFinetuneTask(UnicoreTask):
             # for regression task, pre-compute mean and std
             self.mean = task_metainfo[self.args.task_name]["mean"]
             self.std = task_metainfo[self.args.task_name]["std"]
+        # 【核心修改】从文件加载 Mean 和 Std
+        self.property_norms = None
+        self.mean = None
+        self.std = None
+        if os.path.exists(args.property_norms_path):
+            with open(args.property_norms_path, "rb") as f:
+                self.property_norms = pickle.load(f)
+            # 这里的 self.mean/std 变为字典，供 Loss 函数通过 key 访问
+            self.mean = {k: self.property_norms[k]['mean'] for k in self.property_norms if k != 'num_atoms'}
+            self.std = {k: self.property_norms[k]['std'] for k in self.property_norms if k != 'num_atoms'}
+        else:
+            # 如果没找到 pkl，且原先 task_metainfo 也没定义，则报错
+            if self.args.task_name not in task_metainfo:
+                print(f"Warning: {args.property_norms_path} not found and no metainfo for {args.task_name}")
 
     @classmethod
     def setup_task(cls, args, **kwargs):
@@ -193,8 +211,10 @@ class UniMolFinetuneTask(UnicoreTask):
         """
         split_path = os.path.join(self.args.data, self.args.task_name, split + ".lmdb")
         dataset = LMDBDataset(split_path)
+        target_names = self.args.regression_target_names.split(',')
+
         if split == "train":
-            tgt_dataset = KeyDataset(dataset, "target")
+            tgt_datasets = {name: KeyDataset(dataset, name) for name in target_names}
             smi_dataset = KeyDataset(dataset, "smi")
             sample_dataset = ConformerSampleDataset(
                 dataset, self.args.seed, "atoms", "coordinates"
@@ -205,7 +225,7 @@ class UniMolFinetuneTask(UnicoreTask):
                 dataset, self.args.seed, "atoms", "coordinates", self.args.conf_size
             )
             dataset = AtomTypeDataset(dataset, dataset)
-            tgt_dataset = KeyDataset(dataset, "target")
+            tgt_datasets = {name: KeyDataset(dataset, name) for name in target_names}
             smi_dataset = KeyDataset(dataset, "smi")
 
         dataset = RemoveHydrogenDataset(
@@ -240,29 +260,19 @@ class UniMolFinetuneTask(UnicoreTask):
         nest_dataset = NestedDictionaryDataset(
             {
                 "net_input": {
-                    "src_tokens": RightPadDataset(
-                        src_dataset,
-                        pad_idx=self.dictionary.pad(),
-                    ),
-                    "src_coord": RightPadDatasetCoord(
-                        coord_dataset,
-                        pad_idx=0,
-                    ),
-                    "src_distance": RightPadDataset2D(
-                        distance_dataset,
-                        pad_idx=0,
-                    ),
-                    "src_edge_type": RightPadDataset2D(
-                        edge_type,
-                        pad_idx=0,
-                    ),
+                    "src_tokens": RightPadDataset(src_dataset, pad_idx=self.dictionary.pad()),
+                    "src_coord": RightPadDatasetCoord(coord_dataset, pad_idx=0),
+                    "src_distance": RightPadDataset2D(distance_dataset, pad_idx=0),
+                    "src_edge_type": RightPadDataset2D(edge_type, pad_idx=0),
                 },
                 "target": {
-                    "finetune_target": RawLabelDataset(tgt_dataset),
+                    # 这里动态映射为：homo_target, lumo_target, gap_target, dipole_target
+                    f"{name}_target": RawLabelDataset(tgt_datasets[name]) for name in target_names
                 },
                 "smi_name": RawArrayDataset(smi_dataset),
             },
         )
+        
         if not self.args.no_shuffle and split == "train":
             with data_utils.numpy_seed(self.args.seed):
                 shuffle = np.random.permutation(len(src_dataset))

@@ -28,6 +28,7 @@ class UniMolLoss(UnicoreLoss):
             encoder_coord,
             x_norm,
             delta_encoder_pair_rep_norm,
+            reg_output,  # <--- 【新增】添加一个变量，用于接收忽略第6个返回值(regression_outputs)
         ) = model(**sample[input_key], encoder_masked_tokens=masked_tokens)
         target = sample[target_key]["tokens_target"]
         if masked_tokens is not None:

@@ -265,3 +265,92 @@ class FinetuneMSEPocketLoss(FinetuneMSELoss):
                 mse = ((df["predict"] - df["target"]) ** 2).mean()
                 metrics.log_scalar(f"{split}_mse", mse, sample_size, round=3)
                 metrics.log_scalar(f"{split}_rmse", np.sqrt(mse), sample_size, round=4)
+
+
+@register_loss("multi_task_reg_loss")
+class MultiTaskRegLoss(UnicoreLoss):
+    def __init__(self, task):
+        super().__init__(task)
+
+    def forward(self, model, sample, reduce=True):
+        """
+        计算多任务回归 Loss
+        """
+        # 调用模型，features_only=True 会触发我们刚才修改的返回逻辑
+        net_output = model(
+            **sample["net_input"],
+            features_only=True,
+            classification_head_name=self.args.classification_head_name,
+        )
+        
+        # 解包第 6 个元素：regression_outputs 字典
+        # 结构为 {'homo': tensor, 'lumo': tensor, ...}
+        reg_outputs = net_output[5] 
+        
+        total_loss = 0.
+        logging_output = {}
+        
+        target_names = self.task.args.regression_target_names.split(',')
+        first_target_key = list(sample["target"].keys())[0]
+        sample_size = sample["target"][first_target_key].size(0)
+
+        for name in target_names:
+            if name not in reg_outputs:
+                continue
+            
+            # 模型输出（归一化空间）
+            predict = reg_outputs[name].view(-1).float()
+            # 真实标签（物理空间，来自 LMDB）
+            label = sample["target"][f"{name}_target"].view(-1).float()
+            
+            # 获取该属性对应的均值和标准差（来自 Task 初始化加载的 pkl）
+            mean = self.task.mean[name].type_as(predict)
+            std = self.task.std[name].type_as(predict)
+            
+            # 将标签转到归一化空间计算 MSE Loss
+            norm_label = (label - mean) / std
+            task_loss = F.mse_loss(predict, norm_label, reduction="sum" if reduce else "none")
+            
+            # 累加总 Loss
+            total_loss += task_loss
+            
+            # 计算用于监控的真实物理 MAE (eV/Dipole单位)
+            with torch.no_grad():
+                # 反归一化：预测值 * std + mean
+                real_predict = predict * std + mean
+                mae = F.l1_loss(real_predict, label, reduction="sum")
+                
+                # 存入日志以便在终端显示
+                logging_output[f"{name}_mae_sum"] = mae.data
+                logging_output[f"{name}_loss_sum"] = task_loss.data
+
+        logging_output.update({
+            "loss": total_loss.data,
+            "sample_size": sample_size,
+            "bsz": sample_size,
+        })
+        
+        return total_loss, sample_size, logging_output
+
+    @staticmethod
+    def reduce_metrics(logging_outputs, split="valid") -> None:
+        """汇总所有显卡上的指标并输出到屏幕/Tensorboard"""
+        sample_size = sum(log.get("sample_size", 0) for log in logging_outputs)
+        loss_sum = sum(log.get("loss", 0) for log in logging_outputs)
+        
+        # 记录总 Loss (归一化空间的 MSE)
+        # 注意：fairseq/unicore 习惯除以 log(2)
+        metrics.log_scalar("loss", loss_sum / sample_size / math.log(2), sample_size, round=3)
+        
+        # 动态提取并记录每个子任务的 MAE
+        if len(logging_outputs) > 0:
+            for key in logging_outputs[0].keys():
+                if key.endswith("_mae_sum"):
+                    task_name = key.replace("_mae_sum", "")
+                    total_mae = sum(log.get(key, 0) for log in logging_outputs)
+                    # 输出如 valid_homo_mae: 0.0521
+                    metrics.log_scalar(f"{split}_{task_name}_mae", total_mae / sample_size, sample_size, round=4)
+
+    @staticmethod
+    def logging_outputs_can_be_summed(is_train) -> bool:
+        return True

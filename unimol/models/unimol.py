@@ -198,7 +198,7 @@ class UniMolModel(BaseUnicoreModel):
         """Build a new model instance."""
         return cls(args, task.dictionary)
 
-   def forward(
+    def forward(
         self,
         src_tokens,
         src_distance,
@@ -239,6 +239,24 @@ class UniMolModel(BaseUnicoreModel):
 
         encoder_distance = None
         encoder_coord = None
+        logits = None       # [改动1] 初始化 logits，确保所有路径都能访问该变量
+        # ------------------- [改动2：将回归计算逻辑提前] -------------------
+        regression_outputs = {}
+        if hasattr(self, "regression_heads") and len(self.regression_heads) > 0:
+            for target_name, head_module in self.regression_heads.items():
+                # 使用 [CLS] token (即第 0 位) 进行回归
+                regression_outputs[target_name] = head_module(encoder_rep)
+        # -----------------------------------------------------------
+        # # [改动3] 如果是 features_only，直接返回，注意返回 6 个元素
+        # if features_only:
+        #     return (
+        #         logits, 
+        #         encoder_distance, 
+        #         encoder_coord, 
+        #         x_norm, 
+        #         delta_encoder_pair_rep_norm, 
+        #         regression_outputs # <--- 第 6 个元素
+        #     )
 
         if not features_only:
             if self.args.masked_token_loss > 0:
@@ -262,28 +280,23 @@ class UniMolModel(BaseUnicoreModel):
                 encoder_coord = coords_emb + coord_update
             if self.args.masked_dist_loss > 0:
                 encoder_distance = self.dist_head(encoder_pair_rep)
-                
-        # ------------------- [新增：多属性回归逻辑] -------------------
-        regression_outputs = {}
-        # 只有在 Step 2 传入了目标名称时，regression_heads 才有值
-        if hasattr(self, "regression_heads") and len(self.regression_heads) > 0:
-            for target_name, head_module in self.regression_heads.items():
-                # 使用 [CLS] token (即第 0 位) 进行回归
-                regression_outputs[target_name] = head_module(encoder_rep)
-        # -----------------------------------------------------------
 
+        
         if classification_head_name is not None:
             logits = self.classification_heads[classification_head_name](encoder_rep)
+        
         if self.args.mode == 'infer':
-            return encoder_rep, encoder_pair_rep
+            return encoder_rep, encoder_pair_rep, regression_outputs
         else:
+            # [改动4] 训练模式统一返回 6 个元素，确保解包不报错
             return (
                 logits,
                 encoder_distance,
                 encoder_coord,
                 x_norm,
                 delta_encoder_pair_rep_norm,
-            )          
+                regression_outputs, # <--- 第 6 个元素
+            )    
 
     def register_classification_head(
         self, name, num_classes=None, inner_dim=None, **kwargs
