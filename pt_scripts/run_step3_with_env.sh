@@ -5,15 +5,16 @@
 RAW_DATA_ROOT="/bohr/pt-data-90l5/v3/"
 TASK_NAME="pt_data"
 
-# 【关键】组合出包含 lmdb 和 dict 的完整目录
+# 组合出包含 lmdb 和 dict 的完整目录
 DATA_PATH_FULL="${RAW_DATA_ROOT}/${TASK_NAME}"
 
-# 模型路径
+# 模型路径 (推理阶段已注释，此处保留变量以防未来需要)
 CKPT_PATH="${RAW_DATA_ROOT}/${TASK_NAME}/save_step1_structure/checkpoint_best.pt"
 
-# 输出路径
+# 输出路径 (注意：请确保此目录下已有之前生成的 step1_structure_embeddings.npy 和 ids.txt)
 SAVE_DIR="/share/model/pt_data/active_learning/round1"
 N_CLUSTERS=200
+TOP_K=2  # 新增：每个聚类中心采样的分子数，200 * 2 = 400
 
 # ================= Conda 环境初始化 =================
 # 自动寻找 conda.sh 以便在脚本中使用 conda activate
@@ -28,44 +29,45 @@ fi
 export CUDA_VISIBLE_DEVICES=0
 export OMP_NUM_THREADS=4
 
-echo "=== Step 3: Cold Start (Two-Stage Strategy) ==="
+echo "=== Step 3: Cold Start & Extraction ==="
 echo "Working Dir: $(pwd)"
 echo "Data Path:   $DATA_PATH_FULL"
+echo "Save Dir:    $SAVE_DIR"
 
 # ----------------------------------------------------
-# 阶段 1: 运行 Unimol 推理 (使用 Base 环境)
+# 阶段 1: 运行 Unimol 推理 (已跳过)
 # ----------------------------------------------------
 # echo ">>> [Stage 1] Activating Base Environment..."
 # conda activate base
-
 # echo "[Stage 1] Running Inference..."
-# # 注意：直接调用当前目录下的脚本
-# python step3_part1_inference.py \
-#     --data-path "$DATA_PATH_FULL" \
-#     --ckpt-path "$CKPT_PATH" \
-#     --save-dir "$SAVE_DIR" \
-#     --dict-name "dict.txt" \
-#     --batch-size 256
+# python step3_part1_inference.py ...
+# ... (保持注释即可) ...
 
-# if [ $? -ne 0 ]; then
-#     echo "Inference failed! Exiting."
-#     exit 1
-# fi
-
-# ----------------------------------------------------
-# 阶段 2: 运行 Faiss 聚类 (使用 Faiss 环境)
-# ----------------------------------------------------
 echo ">>> [Stage 2] Activating Faiss Environment..."
 conda activate faiss
 
-echo "[Stage 2] Running Clustering..."
+# 生成 200 个聚类中心，每个保存 10 个备选
 python step3_part2_clustering.py \
     --save-dir "$SAVE_DIR" \
-    --n-clusters $N_CLUSTERS
+    --n-clusters 200 \
+    --buffer-k 10
 
-if [ $? -eq 0 ]; then
-    echo "=== ALL DONE ==="
-    echo "Final Indices: $SAVE_DIR/cold_start_indices.txt"
-else
-    echo "Clustering failed!"
+if [ $? -ne 0 ]; then
+    echo "Clustering failed! Exiting."
+    exit 1
 fi
+
+# ----------------------------------------------------
+# 阶段 3: 提取 XYZ 文件并进行电子数检查 (使用 Base 环境)
+# ----------------------------------------------------
+echo ">>> [Stage 3] Activating Base Environment (for LMDB)..."
+conda activate base
+
+XYZ_OUT_DIR="${SAVE_DIR}/molecules_xyz_filtered"
+
+# 读取生成的 cold_start_candidates.npy，每个聚类强制选出合规的 2 个
+python extract_xyz.py \
+    --lmdb_path "${DATA_PATH_FULL}/train.lmdb" \
+    --candidates_file "${SAVE_DIR}/cold_start_candidates.npy" \
+    --out_dir "$XYZ_OUT_DIR" \
+    --need_per_cluster 2

@@ -286,13 +286,20 @@ class MultiTaskRegLoss(UnicoreLoss):
         # 解包第 6 个元素：regression_outputs 字典
         # 结构为 {'homo': tensor, 'lumo': tensor, ...}
         reg_outputs = net_output[5] 
-        
-        total_loss = 0.
+        if len(reg_outputs) > 0:
+            device = list(reg_outputs.values())[0].device
+        else:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        total_loss = torch.tensor(0.0, device=device)        
         logging_output = {}
         
         target_names = self.task.args.regression_target_names.split(',')
-        first_target_key = list(sample["target"].keys())[0]
-        sample_size = sample["target"][first_target_key].size(0)
+        sample_size = 0
+        for name in target_names:
+            key = f"{name}_target"
+            if key in sample["target"]:
+                sample_size = sample["target"][key].size(0)
+                break
 
         for name in target_names:
             if name not in reg_outputs:
@@ -337,11 +344,15 @@ class MultiTaskRegLoss(UnicoreLoss):
         """汇总所有显卡上的指标并输出到屏幕/Tensorboard"""
         sample_size = sum(log.get("sample_size", 0) for log in logging_outputs)
         loss_sum = sum(log.get("loss", 0) for log in logging_outputs)
+        if sample_size == 0:
+            return
         
         # 记录总 Loss (归一化空间的 MSE)
         # 注意：fairseq/unicore 习惯除以 log(2)
         metrics.log_scalar("loss", loss_sum / sample_size / math.log(2), sample_size, round=3)
-        
+        if split is not None:
+             metrics.log_scalar(f"{split}_loss", loss_sum / sample_size / math.log(2), sample_size, round=3)
+
         # 动态提取并记录每个子任务的 MAE
         if len(logging_outputs) > 0:
             for key in logging_outputs[0].keys():

@@ -27,16 +27,29 @@ class TTADataset(BaseWrapperDataset):
     def __cached_item__(self, index: int, epoch: int):
         smi_idx = index // self.conf_size
         coord_idx = index % self.conf_size
-        atoms = np.array(self.dataset[smi_idx][self.atoms])
-        coordinates = np.array(self.dataset[smi_idx][self.coordinates][coord_idx])
-        smi = self.dataset[smi_idx]["smi"]
-        target = self.dataset[smi_idx].get("target", None)
-        return {
-            "atoms": atoms,
-            "coordinates": coordinates.astype(np.float32),
-            "smi": smi,
-            "target": target,
-        }
+        # --- 修改开始 ---
+        # 1. 获取原始数据字典的浅拷贝
+        raw_data = self.dataset[smi_idx].copy()
+        
+        # 2. 更新必要的字段 (atoms 和 coordinates)
+        atoms = np.array(raw_data[self.atoms])
+        coordinates = np.array(raw_data[self.coordinates][coord_idx])
+        
+        raw_data["atoms"] = atoms
+        raw_data["coordinates"] = coordinates.astype(np.float32)
+        
+        # 3. 直接返回包含所有字段(含homo, lumo等)的字典
+        return raw_data
+        # atoms = np.array(self.dataset[smi_idx][self.atoms])
+        # coordinates = np.array(self.dataset[smi_idx][self.coordinates][coord_idx])
+        # smi = self.dataset[smi_idx]["smi"]
+        # target = self.dataset[smi_idx].get("target", None)
+        # return {
+        #     "atoms": atoms,
+        #     "coordinates": coordinates.astype(np.float32),
+        #     "smi": smi,
+        #     "target": target,
+        # }
 
     def __getitem__(self, index: int):
         return self.__cached_item__(index, self.epoch)

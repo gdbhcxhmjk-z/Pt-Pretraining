@@ -27,6 +27,7 @@ core.*
 # --- Directories ---
 results/
 pt_data/
+log/
 pt_scripts/save/
 pt_scripts/save_finetune/
 test/test_gen_output/

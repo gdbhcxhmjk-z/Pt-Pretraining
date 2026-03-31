@@ -5,73 +5,101 @@ import numpy as np
 from tqdm import tqdm
 import argparse
 
+ATOMIC_NUMBERS = {
+    'H': 1, 'He': 2, 'Li': 3, 'Be': 4, 'B': 5, 'C': 6, 'N': 7, 'O': 8, 'F': 9, 'Ne': 10,
+    'Na': 11, 'Mg': 12, 'Al': 13, 'Si': 14, 'P': 15, 'S': 16, 'Cl': 17, 'Ar': 18,
+    'K': 19, 'Ca': 20, 'Sc': 21, 'Ti': 22, 'V': 23, 'Cr': 24, 'Mn': 25, 'Fe': 26,
+    'Co': 27, 'Ni': 28, 'Cu': 29, 'Zn': 30, 'Ga': 31, 'Ge': 32, 'As': 33, 'Se': 34,
+    'Br': 35, 'Kr': 36, 'Rb': 37, 'Sr': 38, 'Y': 39, 'Zr': 40, 'Ag': 47, 'Cd': 48,
+    'In': 49, 'Sn': 50, 'Sb': 51, 'Te': 52, 'I': 53, 'Xe': 54,'Pt':78
+}
+
+def check_even_electrons(atoms):
+    """检查分子的总电子数是否为偶数"""
+    total_electrons = 0
+    for atom in atoms:
+        symbol = atom.capitalize()
+        if symbol in ATOMIC_NUMBERS:
+            total_electrons += ATOMIC_NUMBERS[symbol]
+        else:
+            return False
+    return total_electrons % 2 == 0
+
 def main():
-    parser = argparse.ArgumentParser(description="Extract XYZ from LMDB based on indices.")
-    parser.add_argument("--lmdb-path", type=str, required=True, help="Path to train.lmdb")
-    parser.add_argument("--indices-file", type=str, required=True, help="Path to cold_start_indices.txt")
-    parser.add_argument("--out-dir", type=str, required=True, help="Directory to save .xyz files")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--lmdb_path", type=str, required=True)
+    # 此时读取的是包含备胎的矩阵
+    parser.add_argument("--candidates_file", type=str, required=True)
+    parser.add_argument("--out_dir", type=str, required=True)
+    # 每个类簇我们需要多少个合规分子（之前200 + 新增200 = 总共400 -> 每个类簇需要2个）
+    parser.add_argument("--need_per_cluster", type=int, default=2)
     args = parser.parse_args()
 
-    # 1. 创建输出目录
     os.makedirs(args.out_dir, exist_ok=True)
 
-    # 2. 读取我们选中的 200 个分子的索引
-    print(f"Loading indices from {args.indices_file}...")
-    selected_indices = np.loadtxt(args.indices_file, dtype=int)
-    print(f"Found {len(selected_indices)} molecules to extract.")
+    # 读取 200 x 10 的候选矩阵
+    candidates_matrix = np.load(args.candidates_file)
+    n_clusters = candidates_matrix.shape[0]
 
-    # 3. 打开 LMDB 数据库
-    print(f"Opening LMDB database: {args.lmdb_path}...")
     env = lmdb.open(
-        args.lmdb_path,
-        subdir=False,
-        readonly=True,
-        lock=False,
-        readahead=False,
-        meminit=False,
-        max_readers=1,
+        args.lmdb_path, subdir=False, readonly=True, lock=False, readahead=False, meminit=False, max_readers=1
     )
 
-    # 4. 遍历提取
+    valid_count = 0
+    total_skipped = 0
+
     with env.begin(write=False) as txn:
         cursor = txn.cursor()
-        # LMDB 的 key 通常是无序的二进制或字符串，但 Uni-Mol 数据集是按顺序写入的
-        # 我们先获取所有的 keys
         keys = list(cursor.iternext(values=False))
         
-        for idx in tqdm(selected_indices, desc="Extracting XYZs"):
-            key = keys[idx]
-            # 获取对应的序列化数据
-            datapoint_pickled = txn.get(key)
-            data = pickle.loads(datapoint_pickled)
+        # 遍历 200 个聚类中心
+        for cluster_idx in tqdm(range(n_clusters), desc="Processing Clusters"):
+            candidates_for_this_cluster = candidates_matrix[cluster_idx]
+            found_for_this_cluster = 0
             
-            # 解析数据
-            # Uni-Mol 默认的 key 是 'smi', 'atoms', 'coordinates'
-            smi = data.get('smi', f'unknown_mol_{idx}')
-            atoms = data.get('atoms')
-            coords = np.array(data.get('coordinates'))
+            # 在这个聚类中心的候选池 (10个) 里依次寻找
+            for rank, mol_id in enumerate(candidates_for_this_cluster):
+                key = keys[mol_id]
+                data = pickle.loads(txn.get(key))
+                
+                atoms = data.get('atoms')
+                
+                # 【核心逻辑】：如果不满足偶数电子，跳过，检查下一个(rank+1)
+                if not check_even_electrons(atoms):
+                    total_skipped += 1
+                    continue
+                
+                # 满足条件，开始提取！
+                smi = data.get('smi', f'unknown_mol_{mol_id}')
+                coords = np.array(data.get('coordinates'))
+                if len(coords.shape) == 3: coords = coords[0]
+                    
+                safe_smi = "".join([c if c.isalnum() else "_" for c in smi])[:40] 
+                
+                # 文件名中加入 cluster_id 和 rank，方便我们知道它是哪个类簇的第几选择
+                filename = f"cluster{cluster_idx:03d}_rank{rank}_idx{mol_id:07d}_{safe_smi}.xyz"
+                filepath = os.path.join(args.out_dir, filename)
+                
+                with open(filepath, 'w') as f:
+                    f.write(f"{len(atoms)}\n")
+                    f.write(f"SMILES: {smi} | Cluster: {cluster_idx} | Rank: {rank}\n")
+                    for atom, coord in zip(atoms, coords):
+                        f.write(f"{atom:2s} {coord[0]:12.6f} {coord[1]:12.6f} {coord[2]:12.6f}\n")
+                
+                valid_count += 1
+                found_for_this_cluster += 1
+                
+                # 如果这个类簇已经找够了需要的分子（比如 2 个），就提前跳出循环，进入下一个类簇
+                if found_for_this_cluster >= args.need_per_cluster:
+                    break
             
-            # 如果坐标包含多个构象 (N_conf, N_atoms, 3)，默认取第一个
-            if len(coords.shape) == 3:
-                coords = coords[0]
-            
-            # 清理文件名 (去除 SMILES 中不能作为文件名的特殊字符，如 / \ * 等)
-            safe_smi = "".join([c if c.isalnum() else "_" for c in smi])
-            # 防止文件名过长
-            safe_smi = safe_smi[:40] 
-            
-            # 生成 XYZ 文件路径
-            filename = f"idx_{idx:07d}_{safe_smi}.xyz"
-            filepath = os.path.join(args.out_dir, filename)
-            
-            # 写入标准的 XYZ 格式
-            with open(filepath, 'w') as f:
-                f.write(f"{len(atoms)}\n")
-                f.write(f"SMILES: {smi} | Index: {idx}\n") # 第二行是注释行，保存完整的 SMILES
-                for atom, coord in zip(atoms, coords):
-                    f.write(f"{atom:2s} {coord[0]:12.6f} {coord[1]:12.6f} {coord[2]:12.6f}\n")
+            # 极端情况预警：如果 10 个备胎全是不合规的
+            if found_for_this_cluster < args.need_per_cluster:
+                print(f"\n[Warning] Cluster {cluster_idx} ran out of candidates! Only found {found_for_this_cluster}.")
 
-    print(f"\n✅ All done! {len(selected_indices)} .xyz files have been saved to '{args.out_dir}'")
+    print(f"\n✅ All done!")
+    print(f" - Valid .xyz Saved     : {valid_count} (Target was {n_clusters * args.need_per_cluster})")
+    print(f" - Skipped Radicals     : {total_skipped}")
 
 if __name__ == "__main__":
     main()
